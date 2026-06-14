@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Manager runtime state (only present if run from inside the repo)
+.vllm-pids/
+.vllm-logs/
+*.log
+*.log.1
+
+# Per-model launch configs live next to the weights, not in this repo
+profiles.toml
+profiles.toml.bak.*
+
+# Editors / OS
+*.swp
+.DS_Store
