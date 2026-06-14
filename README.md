@@ -11,6 +11,12 @@ SM70) running Arch Linux, using the [1Cat-vLLM](https://github.com/1CatAI/1Cat-v
 fork that adds SM70 AWQ kernels. It works on other hardware too, but several
 defaults and helpers assume that target (see "V100 / SM70 notes").
 
+## Guides
+
+- [Qwen3.6 35B and 27B profiles](docs/qwen3.6-profiles.md) - the two Qwen3.6
+  models served here and their `default` / `default-mtp` profiles (128k and 256k
+  variants), with the MTP-is-best observation and benchmark numbers.
+
 ## Contents
 
 | File | Purpose |
