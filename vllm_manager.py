@@ -89,6 +89,11 @@ PYTHON_VERSION = "3.12"  # vLLM wheels are built for 3.12
 # `main` is acceptable but means `setup --v100` rebuilds 30-90 min if upstream moves.
 VLLM_FORK_REPO = "https://github.com/1CatAI/1Cat-vLLM.git"
 VLLM_FORK_REF  = os.environ.get("VLLM_MGR_FORK_REF", "main")
+# Distribution (PyPI metadata) name the fork declares. It is NOT "vllm": the
+# fork's pyproject names the package "1cat-vllm" even though the import module
+# stays `vllm`. uv refuses a `name @ git+...` spec whose name does not match the
+# project metadata, so this must track whatever the fork declares.
+VLLM_FORK_PKG  = "1cat-vllm"
 
 # Source-build parallelism for `setup --v100` (compiling the fork from source).
 # cicc / cudafe++ / ptxas / cc1plus are each SINGLE-THREADED — one invocation
@@ -710,14 +715,23 @@ def cmd_setup(args):
                     print(f"  Clearing stale build cache: {p}")
                     shutil.rmtree(p, ignore_errors=True)
 
-        fork_spec = f"vllm @ git+{VLLM_FORK_REPO}@{VLLM_FORK_REF}"
+        fork_spec = f"{VLLM_FORK_PKG} @ git+{VLLM_FORK_REPO}@{VLLM_FORK_REF}"
         print(f"  Installing pinned ref: {VLLM_FORK_REF}")
         print(f"  (override with VLLM_MGR_FORK_REF=<sha|tag|branch>)")
         print()
+        # Drop any prior upstream `vllm` distribution first: the fork installs
+        # into the same `vllm` import dir but under a different dist name
+        # ("1cat-vllm"), so leaving the old dist installed leaves orphaned files
+        # and a confusing double-listing in `pip list`.
+        _run([
+            "uv", "pip", "uninstall",
+            "--python", _venv_python(),
+            "vllm",
+        ], env=build_env)
         result = _run([
             "uv", "pip", "install",
             "--python", _venv_python(),
-            "--reinstall-package", "vllm",
+            "--reinstall-package", VLLM_FORK_PKG,
             "--no-cache",
             fork_spec,
         ], env=build_env)
