@@ -19,6 +19,9 @@ Stored fields:
     extra_args     raw flag list appended to `vllm serve`
                    e.g. ["--reasoning-parser", "qwen3"]
     env            extra env vars passed to the server process
+    launch_prefix  argv prepended to the server command, e.g.
+                   ["numactl", "--cpunodebind=0", "--membind=0"] to pin the
+                   whole server to one NUMA node on a multi-socket host
 
 Intentionally NOT stored (derived at launch, would only cause drift):
     - model_path   the folder containing profiles.toml identifies the model
@@ -219,6 +222,7 @@ class FamilyInfo:
 
 _KNOWN_FAMILIES = {
     # arch substring -> family tag
+    "GlmMoeDsaForCausalLM":               "glm5_moe",   # GLM-5.x (744B; MLA + DSA)
     "Glm4MoeLiteForCausalLM":             "glm4_moe_lite",
     "Glm4MoeForCausalLM":                 "glm4_moe",
     "Qwen3_5MoeForConditionalGeneration": "qwen3_moe",
@@ -373,6 +377,7 @@ def detect_family(root: str, name: str) -> FamilyInfo:
 # Family -> (tool_parser, reasoning_parser). None means the family doesn't
 # support that capability in any currently shipping vLLM.
 _FAMILY_PARSERS: dict[str, tuple[str | None, str | None]] = {
+    "glm5_moe":      ("glm47", "glm45"),
     "glm4_moe":      ("glm47", "glm45"),
     "glm4_moe_lite": ("glm47", "glm45"),
     "glm4_dense":    ("glm47", "glm45"),
@@ -413,7 +418,11 @@ def suggest_extra_args(
 
     # V100 (SM70): the fork serves attention through a dedicated backend; pin it
     # so vLLM doesn't try to select an SM80+ one (FlashInfer/awq_marlin/etc.).
-    if v100:
+    # MLA models (kv_lora_rank set, e.g. GLM-4.7-Flash / DeepSeek) use a
+    # different attention path — the fork's FLASH_ATTN_V100 kernel is
+    # standard-MHA only, so leave the backend unpinned and let vLLM pick
+    # (typically Triton MLA); pinning it would fail at load.
+    if v100 and info.attn_kind != "mla":
         args += ["--attention-backend", "FLASH_ATTN_V100"]
 
     # Quantisation: always be explicit for AWQ — the only kernel V100 (SM70)
@@ -522,6 +531,8 @@ def read_cached_parsers(path: str) -> tuple[set[str], set[str]]:
 #   kv_budget_per_gpu  = per_gpu_budget_gb - weight_gb_per_gpu - activation_overhead
 #   kv_per_token_bytes = (see below; depends on attn_kind, hybrid, dtype)
 #   max_tokens_total   = kv_budget_per_gpu * tp_size * 1024^3 / kv_per_token_bytes
+#                        (MLA: no tp_size factor — the latent KV is replicated
+#                         on every TP rank, so one GPU's budget is the cap)
 #   recommended_max_len = max_tokens_total / concurrency
 #
 # KV cache per token (across the model, ALL gpus combined; tp splits it):
@@ -660,9 +671,19 @@ def compute_plan(
             concurrency=concurrency, gpu_mem_util=gpu_mem_util, notes=notes,
         )
 
-    # KV cache is sharded across tp_size GPUs (vLLM splits by num_kv_heads or
-    # equivalent). Total budget = per-gpu-budget * tp_size for KV.
-    kv_total_budget_bytes = int(kv_budget_per_gpu_gb * tp_size * (1024 ** 3))
+    # MHA/GQA: KV cache is sharded across tp_size GPUs (vLLM splits by
+    # num_kv_heads), so the pool is per-gpu-budget * tp_size.
+    # MLA: there is ONE compressed latent per token and vLLM replicates it on
+    # every TP rank — capacity is bounded by a single GPU's budget, and TP>1
+    # buys zero extra KV room (only weight/compute sharding).
+    if info.attn_kind == "mla":
+        kv_total_budget_bytes = int(kv_budget_per_gpu_gb * (1024 ** 3))
+        if tp_size > 1:
+            notes.append(
+                "MLA KV cache is replicated across TP ranks — capacity is one "
+                "GPU's KV budget, not the sum. TP>1 still shards the weights.")
+    else:
+        kv_total_budget_bytes = int(kv_budget_per_gpu_gb * tp_size * (1024 ** 3))
     max_tokens_total = kv_total_budget_bytes // kv_bytes_per_token
     max_tokens_at_concurrency = max_tokens_total // max(1, concurrency)
 
@@ -717,6 +738,7 @@ class Profile:
     max_model_len: int = DEFAULT_MAX_MODEL_LEN
     extra_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    launch_prefix: list[str] = field(default_factory=list)
 
 
 def profiles_path(model_dir: str, model_name: str) -> str:
@@ -750,6 +772,7 @@ def _profile_from_dict(name: str, d: dict) -> Profile:
         max_model_len=int(d.get("max_model_len", DEFAULT_MAX_MODEL_LEN)),
         extra_args=[str(x) for x in (d.get("extra_args") or [])],
         env={str(k): str(v) for k, v in (d.get("env") or {}).items()},
+        launch_prefix=[str(x) for x in (d.get("launch_prefix") or [])],
     )
 
 
@@ -780,6 +803,7 @@ def copy_profile(src: Profile, new_name: str,
     # Deep-ish copy for mutable fields.
     d["extra_args"] = list(src.extra_args)
     d["env"] = dict(src.env)
+    d["launch_prefix"] = list(src.launch_prefix)
     return Profile(**d)
 
 
@@ -922,7 +946,7 @@ def _toml_value(v) -> str:
 
 _FIELD_ORDER = [
     "description", "engine", "port", "tp_size", "gpu", "dtype",
-    "gpu_mem_util", "max_model_len", "extra_args", "env",
+    "gpu_mem_util", "max_model_len", "extra_args", "env", "launch_prefix",
 ]
 
 _FIELD_NOTE = {
@@ -936,6 +960,7 @@ _FIELD_NOTE = {
     "max_model_len": "max context length; trim to reduce KV-cache VRAM",
     "extra_args":    "raw flags appended to 'vllm serve'",
     "env":           "extra env vars for the server process",
+    "launch_prefix": "argv prepended to the command, e.g. numactl pinning",
 }
 
 _FILE_HEADER = """\

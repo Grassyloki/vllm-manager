@@ -105,6 +105,45 @@ Note on the benchmark tool's two numbers: with MTP, tokens arrive in bursts, so
 the per-window "steady" figure understates it; the "mean"/overall throughput
 above is the accurate one for spec decode.
 
+## Tuning for the primary workload: coding agents / long chats
+
+These models mostly serve OpenCode/Zed/Continue-style agents: the whole
+conversation (often 50k-150k tokens) is re-sent on every turn, with 1-3
+streams live at a time. That workload shapes three decisions:
+
+1. **Keep prefix caching ON** (it is vLLM's default; do not add
+   `--no-enable-prefix-caching` to the agent-facing profiles). A re-sent
+   prefix skips its prefill entirely — on a 100k-token conversation that is
+   the difference between a sub-second and a multi-minute turn start. The
+   upstream Qwen3.5/3.6 recipe's "+27% decode by disabling prefix caching"
+   applies to single fresh prompts only; for agents the TTFT win dominates.
+   Note the hybrid (linear-attention) layers make prefix caching partially
+   experimental upstream ("align" mode) — if a profile misbehaves after a
+   cache hit, that flag is the first suspect.
+2. **Keep MTP** (`default-mtp`) — measured +17% on the 35B here, and agent
+   traffic is low-concurrency where spec decode wins.
+3. **Verify the crossover with the concurrency benchmark** instead of
+   trusting folklore. As of 2026-07 the benchmark supports parallel streams;
+   aggregate tok/s across N streams is the number that decides MTP-vs-plain:
+
+   ```bash
+   python vllm_manager.py benchmark Qwen3.6-35B-A3B-AWQ \
+       --profile default --profile default-mtp --concurrency 4
+   ```
+
+Two optional variants worth authoring for non-agent use:
+
+| Variant | Change vs `default-mtp` | Use case |
+|---------|------------------------|----------|
+| `latency` | add `--no-enable-prefix-caching` | Single-stream, fresh prompts each time (reported up to +27% decode with MTP upstream — verify here). |
+| `throughput` | drop the `--speculative-config`, raise `--max-num-seqs` to 32 | Many simultaneous users; batching beats spec decode. |
+
+Tool-parser note: profiles here use `hermes`. The upstream Qwen3.5/3.6 recipe
+now suggests `qwen3_coder` for tool calling. Whether the 1Cat fork ships that
+parser is machine-specific — check the registry snapshot at
+`$VLLM_MGR_PID_DIR/vllm-version.txt.json` (written by `setup`); only switch if
+it's listed there, and re-test tool calls in a real agent afterwards.
+
 ## Running them
 
 Pinned ports mean each model always lands on the same address regardless of

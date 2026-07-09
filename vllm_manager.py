@@ -175,12 +175,30 @@ def _save_state(state: dict):
     os.replace(tmp, STATE_FILE)
 
 
+def _port_free(port: int) -> bool:
+    """True if nothing on this host is listening on `port` (bind probe).
+
+    Catches ports held by processes the state file can't see (Docker tenants,
+    a manually launched vLLM, sshd port-forwards, ...).
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
 def _next_port(state: dict) -> int:
-    """Lowest unused port starting from BASE_PORT."""
+    """Lowest port from BASE_PORT not used by us AND actually bindable."""
     used = {v["port"] for v in state.values()}
     port = BASE_PORT
-    while port in used:
+    while port in used or not _port_free(port):
         port += 1
+        if port > BASE_PORT + 1000:  # something is very wrong; fail loudly
+            raise RuntimeError(
+                f"No free port found in {BASE_PORT}-{BASE_PORT + 1000}.")
     return port
 
 
@@ -570,25 +588,54 @@ def _read_mem_gb() -> tuple[int, int]:
     return total, avail
 
 
+def _physical_cores() -> int:
+    """Physical core count (SMT siblings collapsed); cpu_count() fallback.
+
+    Compile jobs are compute-bound, so running one per SMT *thread* just
+    doubles RAM pressure for a few percent of throughput — on a 2x Xeon 6230
+    (40C/80T) that's 79 jobs instead of 39 for no real gain.
+    """
+    try:
+        siblings: set[str] = set()
+        base = "/sys/devices/system/cpu"
+        for entry in os.listdir(base):
+            if not re.fullmatch(r"cpu\d+", entry):
+                continue
+            topo = os.path.join(base, entry, "topology")
+            for fname in ("core_cpus_list", "thread_siblings_list"):
+                p = os.path.join(topo, fname)
+                if os.path.isfile(p):
+                    with open(p) as f:
+                        siblings.add(f.read().strip())
+                    break
+        if siblings:
+            return len(siblings)
+    except OSError:
+        pass
+    return os.cpu_count() or 4
+
+
 def _compute_build_jobs() -> tuple[int, str]:
     """Choose ninja MAX_JOBS for the source build (== cores busy at peak).
 
-    Aims for almost all cores, but caps by RAM (BUILD_MEM_PER_JOB per job,
-    holding BUILD_RESERVE_GB back) so the OOM killer doesn't SIGKILL the
-    single-threaded CUDA compilers. VLLM_MGR_BUILD_JOBS overrides the cap.
+    Aims for almost all PHYSICAL cores, but caps by RAM (BUILD_MEM_PER_JOB
+    per job, holding BUILD_RESERVE_GB back) so the OOM killer doesn't SIGKILL
+    the single-threaded CUDA compilers. VLLM_MGR_BUILD_JOBS overrides the cap.
     Returns (jobs, human_readable_reason).
     """
-    cpu = os.cpu_count() or 4
+    logical = os.cpu_count() or 4
     if BUILD_JOBS > 0:
-        return (max(1, min(BUILD_JOBS, cpu * 2)),
+        return (max(1, min(BUILD_JOBS, logical * 2)),
                 f"VLLM_MGR_BUILD_JOBS={BUILD_JOBS} (manual override)")
+    cpu = _physical_cores()
     total_gb, avail_gb = _read_mem_gb()
     basis_gb = max(1.0, (total_gb or 8) - BUILD_RESERVE_GB)
     ram_jobs = max(1, int(basis_gb / max(0.25, BUILD_MEM_PER_JOB)))
-    cpu_jobs = max(1, cpu - 1)                       # "almost all cores"
+    cpu_jobs = max(1, cpu - 1)               # "almost all physical cores"
     jobs = max(1, min(cpu_jobs, ram_jobs))
-    why = (f"min(cores-1={cpu_jobs}, {basis_gb:.0f}GiB/{BUILD_MEM_PER_JOB:.1f}GiB"
-           f"={ram_jobs}); host {total_gb}GiB RAM, {avail_gb}GiB free now")
+    why = (f"min(physical-cores-1={cpu_jobs}, "
+           f"{basis_gb:.0f}GiB/{BUILD_MEM_PER_JOB:.1f}GiB={ram_jobs}); "
+           f"host {cpu}C/{logical}T, {total_gb}GiB RAM, {avail_gb}GiB free now")
     return jobs, why
 
 
@@ -850,7 +897,18 @@ def _strip_reasoning_args(extra: list[str]) -> list[str]:
 
 def _build_vllm_cmd(model_path: str, served_name: str, port: int,
                     prof: Profile) -> list[str]:
-    cmd = [
+    # Optional NUMA/etc. wrapper (e.g. ["numactl", "--cpunodebind=0",
+    # "--membind=0"]). Dropped with a warning if the binary isn't installed,
+    # so a profile written on the aibox still starts elsewhere.
+    prefix: list[str] = []
+    if prof.launch_prefix:
+        import shutil
+        if shutil.which(prof.launch_prefix[0]):
+            prefix = list(prof.launch_prefix)
+        else:
+            print(f"  WARNING: launch_prefix binary "
+                  f"'{prof.launch_prefix[0]}' not found — ignoring prefix.")
+    cmd = prefix + [
         _venv_python(), "-m", "vllm.entrypoints.openai.api_server",
         "--model",                  model_path,
         "--served-model-name",      served_name,
@@ -911,14 +969,22 @@ def cmd_start(args):
         port = args.port
     elif getattr(prof, "port", 0):
         port = prof.port
-        in_use = {e["port"]: n for n, e in state.items()
-                  if _pid_alive(e["pid"])}
-        if port in in_use:
-            print(f"WARNING: profile [{prof.name}] pins port {port}, but it's "
-                  f"already used by '{in_use[port]}'. Stop it first or override "
-                  f"with --port.")
     else:
         port = _next_port(state)
+
+    # For an explicitly chosen port (flag or pinned), verify it's actually
+    # available before paying a multi-minute model load that dies at bind.
+    if (args.port or getattr(prof, "port", 0)) and not _port_free(port):
+        in_use = {e["port"]: n for n, e in state.items()
+                  if _pid_alive(e["pid"])}
+        holder = (f"'{in_use[port]}'" if port in in_use
+                  else "another process (not managed by this tool)")
+        print(f"ERROR: port {port} is already in use by {holder}.")
+        print(f"  Stop it first, change the profile's port, or use --port.")
+        if not getattr(args, "force", False):
+            sys.exit(1)
+        print("  --force given — continuing anyway (vLLM will likely "
+              "fail at bind).")
     model_info = scan_local_model(MODEL_DIR, name)
     weight_gb = int(round(model_info.weight_bytes / (1024 ** 3)))
     serve_path = _resolve_serve_path(name)
@@ -973,6 +1039,8 @@ def cmd_start(args):
         print(f"  Reasoning: OFF (stripped --reasoning-parser for this launch)")
     if prof.extra_args:
         print(f"  Extra:    {' '.join(prof.extra_args)}")
+    if prof.launch_prefix:
+        print(f"  Prefix:   {' '.join(prof.launch_prefix)}")
 
     log_file = os.path.join(LOG_DIR, f"{name}.log")
     # Keep the previous run's log (so a crash's output survives the next start)
@@ -1736,7 +1804,7 @@ class _BenchCfg:
                  warmup=BENCH_WARMUP, runs=BENCH_RUNS, window=BENCH_WINDOW_SEC,
                  ready_timeout=BENCH_READY_TIMEOUT,
                  freeze_timeout=BENCH_FREEZE_TIMEOUT, stall_gap=BENCH_STALL_GAP,
-                 escalate=True, save_json=True):
+                 escalate=True, save_json=True, concurrency=1):
         self.prompt = prompt
         self.max_tokens = max_tokens
         self.warmup = warmup
@@ -1747,6 +1815,7 @@ class _BenchCfg:
         self.stall_gap = stall_gap
         self.escalate = escalate
         self.save_json = save_json
+        self.concurrency = max(1, int(concurrency))
 
 
 # -- process / kill helpers ---------------------------------------------------
@@ -1944,6 +2013,54 @@ def _bench_stream(port, model_name, prompt, max_tokens, freeze_timeout) -> dict:
     }
 
 
+def _bench_streams_concurrent(port, model_name, cfg, sample_cb=None) -> dict:
+    """Run cfg.concurrency parallel streaming generations; merge the metrics.
+
+    concurrency=1 degrades to a single _bench_stream. For N>1 the streams'
+    token timelines are merged, so steady/mean tok/s measure AGGREGATE decode
+    throughput across the batch (the number that tells you whether spec decode
+    beats plain batching at this load). Each stream gets a slightly different
+    prompt so prefix caching can't share the prefill across the batch.
+    `sample_cb` is polled while streams run (GPU peak-VRAM sampling).
+    """
+    n = cfg.concurrency
+    if n == 1:
+        s = _bench_stream(port, model_name, cfg.prompt, cfg.max_tokens,
+                          cfg.freeze_timeout)
+        if sample_cb:
+            sample_cb()
+        return s
+
+    from concurrent.futures import ThreadPoolExecutor
+    prompts = [f"{cfg.prompt} [stream {k + 1}]" for k in range(n)]
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        futs = [ex.submit(_bench_stream, port, model_name, pr,
+                          cfg.max_tokens, cfg.freeze_timeout)
+                for pr in prompts]
+        while any(not f.done() for f in futs):
+            if sample_cb:
+                sample_cb()
+            time.sleep(1.0)
+    streams = [f.result() for f in futs]
+
+    merged = sorted(t for s in streams for t in s["token_times"])
+    gaps = [merged[i + 1] - merged[i] for i in range(len(merged) - 1)]
+    ttfts = [s["ttft"] for s in streams if s["ttft"] is not None]
+    errors = sorted({s["error"] for s in streams if s["error"]})
+    prompt_toks = [s["prompt_tokens"] for s in streams
+                   if s["prompt_tokens"] is not None]
+    return {
+        "error": "; ".join(errors) or None,
+        "ttft": (sum(ttfts) / len(ttfts)) if ttfts else None,
+        "token_times": merged,
+        "chunk_tokens": sum(s["chunk_tokens"] for s in streams),
+        "completion_tokens": sum(s["completion_tokens"] or 0 for s in streams),
+        "prompt_tokens": sum(prompt_toks) if prompt_toks else None,
+        "gen_span": (merged[-1] - merged[0]) if len(merged) >= 2 else 0.0,
+        "gaps": gaps,
+    }
+
+
 def _bench_wait_ready(proc, port, timeout, log) -> str:
     """Poll until ready, the process dies, or timeout. Returns one of
     'ready' | 'crashed' | 'timeout'."""
@@ -1997,11 +2114,14 @@ def _bench_one(name: str, profile_name: str, cfg: "_BenchCfg", log) -> dict:
     Never raises; records failures (crash/timeout/freeze) in the result."""
     res = {
         "model": name, "profile": profile_name, "status": "error", "detail": "",
+        "concurrency": cfg.concurrency,
         "ttft_ms": None, "steady_tps": None, "mean_tps": None,
         "completion_tokens": None, "stalls": None, "max_gap_s": None,
         "load_s": None, "gpu_peak_mb": {}, "runs": [],
     }
-    log(f"\n=== {name} / {profile_name} ===")
+    log(f"\n=== {name} / {profile_name}"
+        + (f"  (concurrency {cfg.concurrency})" if cfg.concurrency > 1 else "")
+        + " ===")
 
     try:
         prof = _resolve_profile(name, profile_name)
@@ -2096,8 +2216,9 @@ def _bench_one(name: str, profile_name: str, cfg: "_BenchCfg", log) -> dict:
         for _ in range(cfg.warmup):
             if proc.poll() is not None:
                 break
-            _bench_stream(port, name, cfg.prompt, cfg.max_tokens,
-                          cfg.freeze_timeout)
+            # Warm up at the measured concurrency so CUDA graphs / batch
+            # paths for that batch size are captured before timing starts.
+            _bench_streams_concurrent(port, name, cfg)
 
         measured = []
         for i in range(cfg.runs):
@@ -2108,8 +2229,8 @@ def _bench_one(name: str, profile_name: str, cfg: "_BenchCfg", log) -> dict:
                 for ln in _tail_lines(log_file, 12):
                     log(f"    | {ln}")
                 return res
-            s = _bench_stream(port, name, cfg.prompt, cfg.max_tokens,
-                              cfg.freeze_timeout)
+            s = _bench_streams_concurrent(port, name, cfg,
+                                          sample_cb=_sample_gpu)
             steady = _bench_steady_tps(s["token_times"], cfg.window)
             mean = (s["completion_tokens"] / s["gen_span"]
                     if s["gen_span"] > 0 else 0.0)
@@ -2169,10 +2290,10 @@ def _print_bench_table(results: list[dict], log):
         return {int(k): v for k, v in (r.get("gpu_peak_mb") or {}).items()}
     gpu_ids = sorted({i for r in results for i in _peak(r)})[:4]
     gpu_hdr = "".join(f" {('G' + str(i) + ' GiB'):>9}" for i in gpu_ids)
-    width = 94 + len(gpu_hdr)
+    width = 99 + len(gpu_hdr)
     log("")
     log("=" * width)
-    log(f"  {'Model':<22} {'Profile':<14} {'Status':<8} {'Steady':>8} "
+    log(f"  {'Model':<22} {'Profile':<14} {'Status':<8} {'Conc':>4} {'Steady':>8} "
         f"{'Mean':>7} {'TTFT':>8} {'Tokens':>7} {'Stall':>6} {'Load':>6}{gpu_hdr}")
     log("  " + "-" * (width - 2))
     for r in results:
@@ -2186,8 +2307,9 @@ def _print_bench_table(results: list[dict], log):
         gpu_cells = "".join(
             f" {(f'{peak[i] / 1024:.1f}' if peak.get(i) else '-'):>9}"
             for i in gpu_ids)
+        conc = r.get("concurrency") or 1
         log(f"  {r['model'][:22]:<22} {r['profile'][:14]:<14} {r['status']:<8} "
-            f"{steady:>8} {mean:>7} {ttft:>8} {str(toks):>7} "
+            f"{conc:>4} {steady:>8} {mean:>7} {ttft:>8} {str(toks):>7} "
             f"{str(stall):>6} {load:>6}{gpu_cells}")
         if r['status'] != "ok" and r['detail']:
             log(f"      reason: {r['detail']}")
@@ -2201,8 +2323,12 @@ def _run_benchmarks(targets: list[tuple], cfg: "_BenchCfg", log=print) -> list[d
     total = sum(len(p) for _, p in targets)
     log(f"Benchmarking {total} profile-run(s) across {len(targets)} model(s).")
     log(f"  ~{cfg.max_tokens} tok/run, warm-up {cfg.warmup}, measured {cfg.runs}, "
-        f"window {cfg.window}s, freeze>{cfg.freeze_timeout}s, "
+        f"concurrency {cfg.concurrency}, window {cfg.window}s, "
+        f"freeze>{cfg.freeze_timeout}s, "
         f"escalate={'on' if cfg.escalate else 'off'}")
+    if cfg.concurrency > 1:
+        log(f"  (tok/s figures are AGGREGATE across {cfg.concurrency} parallel "
+            f"streams; each stream gets a distinct prompt)")
     results: list[dict] = []
     i = 0
     for name, profiles in targets:
@@ -2259,7 +2385,7 @@ def cmd_benchmark(args):
         max_tokens=args.max_tokens, warmup=args.warmup, runs=args.runs,
         window=args.window, ready_timeout=args.ready_timeout,
         freeze_timeout=args.freeze_timeout, escalate=not args.no_escalate,
-        save_json=not args.no_save,
+        save_json=not args.no_save, concurrency=args.concurrency,
     )
     if args.prompt:
         cfg.prompt = args.prompt
@@ -2862,6 +2988,9 @@ def main():
                     help=f"Measured runs per profile (default: {BENCH_RUNS})")
     sp.add_argument("--warmup", type=int, default=BENCH_WARMUP,
                     help=f"Discarded warm-up runs (default: {BENCH_WARMUP})")
+    sp.add_argument("--concurrency", type=int, default=1, metavar="N",
+                    help="Parallel streams per measured run; tok/s is the "
+                         "aggregate across streams (default: 1)")
     sp.add_argument("--window", type=float, default=BENCH_WINDOW_SEC,
                     help="Sliding window (s) for steady-state tok/s")
     sp.add_argument("--ready-timeout", type=int, default=BENCH_READY_TIMEOUT,

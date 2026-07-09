@@ -15,6 +15,9 @@ venv/
 profiles.toml
 profiles.toml.bak.*
 
+# Agent work log — machine-local notes for AI agents, not for the repo
+AGENT_NOTES.md
+
 # Editors / OS
 *.swp
 .DS_Store

@@ -1354,6 +1354,7 @@ def _format_profile(p: Profile) -> str:
         "max_model_len",
         "extra_args",
         "env",
+        "launch_prefix",
     ):
         if k in d:
             lines.append(f"    {k:<14} = {d[k]!r}")
