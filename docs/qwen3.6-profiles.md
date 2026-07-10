@@ -30,6 +30,12 @@ startup lean. Served model ids are the folder names: `Qwen3.6-35B-A3B-AWQ` and
 
 ## The profiles
 
+Don't hand-author these — they're in the curated catalog:
+
+```bash
+python manage_models.py seed-profiles          # writes all four per model
+```
+
 Four profiles per model, a 2x2 of {default, MTP} x {128k, 256k}:
 
 | Profile | Context | MTP (spec decode) | max-num-seqs | When to use |

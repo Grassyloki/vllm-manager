@@ -46,6 +46,13 @@ Unlike the Qwen models, GLM-4.7-Flash caches one compressed latent per token
 
 ## The profiles
 
+Don't hand-author these — after downloading, seed them from the curated
+catalog (it backs up and merges; custom profiles are untouched):
+
+```bash
+python manage_models.py seed-profiles GLM-4.7-Flash-AWQ
+```
+
 | Profile | TP | Context | MTP | When to use |
 |---------|----|---------|-----|-------------|
 | `default` | 2 | 131072 | no | Baseline / fallback. |

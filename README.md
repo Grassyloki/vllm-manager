@@ -112,6 +112,8 @@ Model downloads and profile authoring live in `manage_models.py`:
 python manage_models.py download <org/repo>           # HF download (HF-format or GGUF picker)
 python manage_models.py download <org/repo> --dry-run # inspect variants/fit, no download
 python manage_models.py download <org/repo> --offload [--ram GB]  # budget VRAM + system RAM
+python manage_models.py seed-profiles [--list] [--yes]  # write the curated profile
+                                                        # sets for the standard models
 python manage_models.py list
 python manage_models.py delete <model>
 python manage_models.py profile list  <model>
@@ -132,6 +134,10 @@ Downloads are host-aware:
 - After an HF download, the default profile is sized by the same planner as
   `plan` (tp_size, max_model_len, V100 arg set, parser gating) instead of a
   naive tp=1 template.
+- `seed-profiles` writes the full curated profile sets documented in the
+  guides (Qwen3.6 35B → port 7001, 27B → 7002, GLM-4.7-Flash → 7003),
+  backing up and merging with any existing profiles.toml — custom profiles
+  are never touched. Also available in the TUI as "Seed Curated Profiles".
 
 ## Launch profiles
 

@@ -844,6 +844,7 @@ def _tui_main(stdscr):
         ("Download Model", 0),
         ("Delete Model", 0),
         ("Profile Manager", 0),
+        ("Seed Curated Profiles", 0),
         ("Help", 0),
         ("Quit", None),
     ]
@@ -950,6 +951,11 @@ def _tui_main(stdscr):
                     _tui_act_profiles(stdscr, sel.name)
                 stdscr.touchwin()
         elif idx == 3:
+            # Seed Curated Profiles \u2014 interactive confirms run inside run_cmd
+            # (already out of curses there).
+            tui.run_cmd(stdscr, cmd_seed_profiles,
+                        argparse.Namespace(models=[], yes=False, list=False))
+        elif idx == 4:
             # Help
             curses.endwin()
             print("""
@@ -959,11 +965,13 @@ def _tui_main(stdscr):
     [Up]/[Down]    Navigate main menu
     [Enter]        Execute selected action
   Actions:
-    Download Model     Fetch a GGUF model from HuggingFace (GGUF picker)
-    Delete Model       Remove an installed model folder
-    Profile Manager    Manage launch profiles for a model
-    Help               Show this screen
-    Quit               Exit the TUI
+    Download Model         Fetch a GGUF model from HuggingFace (GGUF picker)
+    Delete Model           Remove an installed model folder
+    Profile Manager        Manage launch profiles for a model
+    Seed Curated Profiles  Write the documented profile sets for the
+                           standard models (Qwen3.6 35B/27B, GLM-4.7-Flash)
+    Help                   Show this screen
+    Quit                   Exit the TUI
   Download:
     Interactive GGUF variant picker with VRAM budget, size, shard count,
     and automatic profile creation after download.
@@ -1571,6 +1579,201 @@ def cmd_download(args):
 
 
 # =============================================================================
+# seed-profiles — curated, benchmarked profile sets for this box's standard
+# models. Single source of truth for what the docs describe:
+#   docs/qwen3.6-profiles.md   (Qwen3.6 35B / 27B on 2x V100)
+#   docs/glm-4.7-flash.md      (GLM-4.7-Flash on 2x V100)
+# Parser flags here are intentionally NOT gated by the registry probe — these
+# sets are the documented, validated configs (measured on the box for Qwen;
+# GLM pending on-box verification, see its guide).
+# =============================================================================
+
+
+def _qwen36_profiles(port: int) -> dict[str, Profile]:
+    """The 2x2 {default, MTP} x {128k, 256k} set from docs/qwen3.6-profiles.md."""
+    base = [
+        "--attention-backend", "FLASH_ATTN_V100",
+        "--quantization", "awq",
+        "--reasoning-parser", "qwen3",
+        "--enable-auto-tool-choice", "--tool-call-parser", "hermes",
+        "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
+        "--skip-mm-profiling",
+    ]
+    mtp = ["--speculative-config",
+           '{"method": "mtp", "num_speculative_tokens": 2}']
+
+    def prof(name: str, desc: str, ctx: int, seqs: int,
+             tail: list[str]) -> Profile:
+        return Profile(
+            name=name, description=desc, engine="vllm", port=port,
+            tp_size=2, gpu="0,1", dtype="half", gpu_mem_util=0.88,
+            max_model_len=ctx,
+            extra_args=base + ["--max-num-seqs", str(seqs),
+                               "--max-num-batched-tokens", "8192"] + tail,
+        )
+
+    return {
+        "default": prof(
+            "default", "Baseline @128k. TP=2 across both GPUs.",
+            131072, 16, []),
+        "default-256k": prof(
+            "default-256k", "Baseline @ full 256k context.",
+            262144, 8, []),
+        "default-mtp": prof(
+            "default-mtp",
+            "Balanced @128k + MTP speculative decoding (2). Recommended.",
+            131072, 16, mtp),
+        "default-mtp-256k": prof(
+            "default-mtp-256k",
+            "Full 256k context + MTP (2). Recommended for long context.",
+            262144, 8, mtp),
+    }
+
+
+def _glm47_flash_profiles(port: int) -> dict[str, Profile]:
+    """The set from docs/glm-4.7-flash.md. MLA model: no attention-backend
+    pin (FLASH_ATTN_V100 is MHA-only), and MTP starts at 1 draft token
+    (the model ships one MTP layer)."""
+    base = [
+        "--quantization", "awq",
+        "--reasoning-parser", "glm45",
+        "--enable-auto-tool-choice", "--tool-call-parser", "glm47",
+    ]
+    mtp = ["--speculative-config",
+           '{"method": "mtp", "num_speculative_tokens": 1}']
+
+    def prof(name: str, desc: str, ctx: int, seqs: int, tail: list[str],
+             tp: int = 2, gpu: str = "0,1") -> Profile:
+        return Profile(
+            name=name, description=desc, engine="vllm", port=port,
+            tp_size=tp, gpu=gpu, dtype="half", gpu_mem_util=0.88,
+            max_model_len=ctx,
+            extra_args=base + ["--max-num-seqs", str(seqs),
+                               "--max-num-batched-tokens", "8192"] + tail,
+        )
+
+    return {
+        "default": prof(
+            "default", "Baseline @128k. TP=2 across both GPUs.",
+            131072, 16, []),
+        "default-mtp": prof(
+            "default-mtp",
+            "Balanced @128k + MTP (1 draft token). Recommended once verified.",
+            131072, 16, mtp),
+        "default-200k": prof(
+            "default-200k", "Full native 202k context + MTP (1).",
+            202752, 8, mtp),
+        "solo-gpu": prof(
+            "solo-gpu", "Single-GPU variant; leaves GPU 0 free for co-running.",
+            131072, 16, [], tp=1, gpu="1"),
+    }
+
+
+# Canonical folder name -> (profile builder, note shown in listings).
+CURATED_MODELS: dict = {
+    "Qwen3.6-35B-A3B-AWQ": (
+        lambda: _qwen36_profiles(7001),
+        "MoE 35B; measured on-box, MTP +17%"),
+    "Qwen3.6-27B-AWQ-MTP": (
+        lambda: _qwen36_profiles(7002),
+        "dense 27B; measured on-box"),
+    "GLM-4.7-Flash-AWQ": (
+        lambda: _glm47_flash_profiles(7003),
+        "MLA MoE 30B; UNVERIFIED on the fork — see docs/glm-4.7-flash.md"),
+}
+
+
+def _find_model_folder(canonical: str) -> str | None:
+    """On-disk folder for a curated model, matched case-insensitively."""
+    if not os.path.isdir(DEFAULT_MODEL_DIR):
+        return None
+    for entry in os.listdir(DEFAULT_MODEL_DIR):
+        if (entry.lower() == canonical.lower()
+                and os.path.isdir(os.path.join(DEFAULT_MODEL_DIR, entry))):
+            return entry
+    return None
+
+
+def cmd_seed_profiles(args):
+    """Write the curated profile sets for this box's standard models."""
+    if args.list:
+        print(f"\n  Curated models (model dir: {DEFAULT_MODEL_DIR}):\n")
+        for canon, (_builder, note) in CURATED_MODELS.items():
+            folder = _find_model_folder(canon)
+            state = f"present as '{folder}'" if folder else "NOT on disk"
+            print(f"    {canon:<24} {state:<32} {note}")
+        print()
+        return
+
+    if args.models:
+        targets = []
+        for name in args.models:
+            canon = next((c for c in CURATED_MODELS
+                          if c.lower() == name.lower()), None)
+            if canon is None:
+                sys.exit(f"'{name}' is not a curated model. "
+                         f"Have: {', '.join(CURATED_MODELS)}")
+            folder = _find_model_folder(canon)
+            if folder is None:
+                sys.exit(f"'{canon}' is not on disk under {DEFAULT_MODEL_DIR}. "
+                         f"Download it first (see the docs/ guide).")
+            targets.append((canon, folder))
+    else:
+        targets = [(c, f) for c in CURATED_MODELS
+                   if (f := _find_model_folder(c))]
+        missing = [c for c in CURATED_MODELS if not _find_model_folder(c)]
+        if missing:
+            print(f"\n  Skipping (not on disk): {', '.join(missing)}")
+        if not targets:
+            sys.exit("  No curated models found on disk. "
+                     "Run with --list to see the catalog.")
+
+    for canon, folder in targets:
+        builder, note = CURATED_MODELS[canon]
+        curated = builder()
+        existing = load_profiles(DEFAULT_MODEL_DIR, folder)
+
+        added, updated, unchanged = [], [], []
+        for pname, prof in curated.items():
+            if pname not in existing:
+                added.append(pname)
+            elif asdict(existing[pname]) != asdict(prof):
+                updated.append(pname)
+            else:
+                unchanged.append(pname)
+        custom = [p for p in existing if p not in curated]
+
+        print(f"\n  {folder}  ({note})")
+        for label, names in (("add", added), ("update", updated),
+                             ("keep (already match)", unchanged),
+                             ("keep (custom, untouched)", custom)):
+            if names:
+                print(f"    {label}: {', '.join(sorted(names))}")
+
+        if not added and not updated:
+            print("    Nothing to do.")
+            continue
+
+        if not args.yes:
+            try:
+                resp = input("    Write these profiles? [Y/n]: ").strip().lower()
+            except EOFError:
+                resp = ""
+            if resp in ("n", "no"):
+                print("    Skipped.")
+                continue
+
+        path = profiles_path(DEFAULT_MODEL_DIR, folder)
+        if os.path.isfile(path):
+            shutil.copy2(path, path + ".bak")
+            print(f"    Backed up to {path}.bak")
+        merged = dict(existing)
+        merged.update(curated)
+        save_profiles(DEFAULT_MODEL_DIR, folder, merged)
+        print(f"    Wrote {path}")
+
+
+# =============================================================================
 # profile subcommands
 # =============================================================================
 
@@ -1800,6 +2003,20 @@ def build_parser() -> argparse.ArgumentParser:
              "instead of picking a GGUF quant",
     )
 
+    sp = sub.add_parser(
+        "seed-profiles",
+        help="Write the curated (documented, benchmarked) profile sets for "
+             "this box's standard models",
+    )
+    sp.add_argument(
+        "models", nargs="*", metavar="model",
+        help="Curated model(s) to seed (default: all found on disk)",
+    )
+    sp.add_argument("--yes", action="store_true",
+                    help="Write without per-model confirmation")
+    sp.add_argument("--list", action="store_true",
+                    help="Show the catalog and each model's on-disk state")
+
     pp = sub.add_parser("profile", help="Manage per-model launch profiles")
     psub = pp.add_subparsers(dest="psub", required=True)
 
@@ -1853,6 +2070,7 @@ def main():
         "list": cmd_list,
         "delete": cmd_delete,
         "download": cmd_download,
+        "seed-profiles": cmd_seed_profiles,
     }
     if args.cmd == "profile":
         sub_dispatch = {
