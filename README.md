@@ -110,6 +110,8 @@ Model downloads and profile authoring live in `manage_models.py`:
 
 ```bash
 python manage_models.py download <org/repo>           # HF download (HF-format or GGUF picker)
+python manage_models.py download <org/repo> --dry-run # inspect variants/fit, no download
+python manage_models.py download <org/repo> --offload [--ram GB]  # budget VRAM + system RAM
 python manage_models.py list
 python manage_models.py delete <model>
 python manage_models.py profile list  <model>
@@ -117,6 +119,19 @@ python manage_models.py profile show  <model> [name]
 python manage_models.py profile add   <model> <name>
 python manage_models.py profile edit  <model>         # open profiles.toml in $EDITOR
 ```
+
+Downloads are host-aware:
+
+- The VRAM budget defaults to the GPUs nvidia-smi actually reports (override
+  with `--vram`); `--offload` adds 85% of system RAM for llama.cpp-style
+  CPU+GPU MoE offload when picking a GGUF quant.
+- On V100 (SM70) hosts, HF-format downloads are checked against the repo's
+  `quantization_config` first: checkpoints whose kernels need SM80+
+  (compressed-tensors/Marlin, FP8, NVFP4, ...) trigger a warning before any
+  bytes move — many repos named "AWQ" are actually compressed-tensors.
+- After an HF download, the default profile is sized by the same planner as
+  `plan` (tp_size, max_model_len, V100 arg set, parser gating) instead of a
+  naive tp=1 template.
 
 ## Launch profiles
 

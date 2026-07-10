@@ -815,6 +815,7 @@ def ensure_profiles_exist(
     available_reasoning_parsers: set[str] | None = None,
     tool_use: bool = True,
     reasoning: bool = True,
+    v100: bool = False,
 ) -> tuple[dict[str, Profile], bool]:
     """Create profiles.toml with a [default] profile if none exists yet.
 
@@ -844,6 +845,7 @@ def ensure_profiles_exist(
         tp_size=tp_size,
         tool_use=tool_use,
         reasoning=reasoning,
+        v100=v100,
         available_tool_parsers=available_tool_parsers,
         available_reasoning_parsers=available_reasoning_parsers,
     )

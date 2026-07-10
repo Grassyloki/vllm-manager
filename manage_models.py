@@ -63,6 +63,11 @@ ROOTS: list[tuple[str, str]] = [
     (LMSTUDIO_MODEL_DIR, "lmstudio"),
 ]
 
+# Where vllm_manager's setup caches the vLLM parser registry. Used to gate
+# parser flags in auto-created profiles (same rule as vllm_manager itself).
+PID_DIR = os.environ.get("VLLM_MGR_PID_DIR", "/root/.vllm-pids")
+PARSER_CACHE = os.path.join(PID_DIR, "vllm-version.txt.json")
+
 QUANT_PREFERENCE = [
     "UD-Q4_K_XL",
     "Q4_K_M",
@@ -80,6 +85,77 @@ QUANT_PREFERENCE = [
 ]
 
 SHARD_RE = model_lib.SHARD_RE
+
+
+# == Host probing (GPUs, V100 detection, parser registry, RAM) ===============
+# Auto-created profiles must match the host they'll run on: SM70 hosts need
+# the V100 arg set (and must NOT get --enable-expert-parallel), and parser
+# flags must be gated by what the installed vLLM build actually ships.
+
+_HOST_GPUS: list[dict] | None = None
+
+
+def _host_gpus() -> list[dict]:
+    """[{index, name, mem_total_mb, compute_cap}] via nvidia-smi; cached.
+
+    [] on GPU-less hosts (e.g. the dev laptop) — callers fall back to
+    generic defaults then.
+    """
+    global _HOST_GPUS
+    if _HOST_GPUS is not None:
+        return _HOST_GPUS
+    out: list[dict] = []
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=6)
+        if r.returncode == 0:
+            for line in r.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 3:
+                    continue
+                try:
+                    out.append({
+                        "index": int(parts[0]), "name": parts[1],
+                        "mem_total_mb": int(float(parts[2])),
+                        "compute_cap": parts[3] if len(parts) > 3 else "",
+                    })
+                except ValueError:
+                    continue
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _HOST_GPUS = out
+    return out
+
+
+def _host_is_v100() -> bool:
+    return any((g.get("compute_cap") or "").startswith("7.0")
+               or "V100" in (g.get("name") or "")
+               for g in _host_gpus())
+
+
+def _default_vram_gb() -> float:
+    """Total VRAM across host GPUs, or DEFAULT_VRAM_GB if none detected."""
+    gpus = _host_gpus()
+    if gpus:
+        return sum(g["mem_total_mb"] for g in gpus) / 1024
+    return float(DEFAULT_VRAM_GB)
+
+
+def _cached_parsers() -> tuple[set[str], set[str]]:
+    return model_lib.read_cached_parsers(PARSER_CACHE)
+
+
+def _host_ram_gb() -> float:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except OSError:
+        pass
+    return 0.0
 
 
 # == Multi-root scanning =====================================================
@@ -138,6 +214,10 @@ def resolve_model(name: str) -> tuple[str, str, LocalModel] | None:
             matches.append((root, layout, m))
     if len(matches) == 1:
         return matches[0]
+    if len(matches) > 1:
+        print(f"  '{name}' is ambiguous — use the full publisher/repo name:")
+        for _, _, m in matches:
+            print(f"    {m.name}")
     return None
 
 
@@ -166,6 +246,69 @@ _C_RED     = tui.C_RED
 # == TUI actions ==
 
 
+def _create_planned_profile(root: str, short: str) -> None:
+    """Create a [default] profile sized by compute_plan for THIS host's GPUs.
+
+    Replaces the old naive default (tp_size=1, native context) that OOM'd
+    for anything bigger than one GPU. Picks tp_size / max_model_len from the
+    sizing planner, applies the V100 arg set on SM70 hosts, and gates parser
+    flags by the installed build's registry. GPU-less hosts (dev laptop)
+    fall back to the generic auto-template.
+    """
+    if load_profiles(root, short):
+        print(f"    Kept existing {profiles_path(root, short)}")
+        return
+    v100 = _host_is_v100()
+    tools, reasonings = _cached_parsers()
+    gpus = _host_gpus()
+
+    if not gpus:
+        ensure_profiles_exist(
+            root, short, interactive=False, v100=v100,
+            available_tool_parsers=tools or None,
+            available_reasoning_parsers=reasonings or None,
+        )
+        print(f"    Wrote {profiles_path(root, short)} "
+              f"(no GPU detected — generic default; run `plan` on the host)")
+        return
+
+    m = scan_local_model(root, short)
+    info = model_lib.detect_family(root, short)
+    vram = max(1, min(g["mem_total_mb"] for g in gpus) // 1024)
+    mem_util = 0.88 if v100 else 0.90
+    plan = model_lib.compute_plan(
+        m, info, vram_per_gpu_gb=vram, num_gpus=len(gpus),
+        gpu_mem_util=mem_util, concurrency=2,
+    )
+    if plan.fits and plan.recommended_max_len:
+        max_len = plan.recommended_max_len
+    else:
+        max_len = detect_model_max_len(root, short) or DEFAULT_MAX_MODEL_LEN
+    extra = model_lib.suggest_extra_args(
+        info, tp_size=plan.tp_size, v100=v100,
+        available_tool_parsers=tools or None,
+        available_reasoning_parsers=reasonings or None,
+    )
+    prof = make_default_profile(
+        description=(f"Auto-planned at download for "
+                     f"{plan.tp_size}x{vram}GB, concurrency=2."),
+        tp_size=plan.tp_size,
+        gpu=",".join(str(i) for i in range(plan.tp_size)),
+        gpu_mem_util=mem_util,
+        max_model_len=max_len,
+        extra_args=extra or None,
+    )
+    save_profiles(root, short, {"default": prof})
+    print(f"    Wrote {profiles_path(root, short)}")
+    print(f"    Planned: tp_size={plan.tp_size}  max_model_len={max_len}  "
+          f"gpu_mem_util={mem_util}" + ("  (V100 arg set)" if v100 else ""))
+    if not plan.fits:
+        print(f"    WARNING: the planner says this model does NOT fit "
+              f"({plan.tp_size}x{vram}GB) — inspect `plan {short}` before starting.")
+    for n in plan.notes:
+        print(f"    note: {n}")
+
+
 def _post_download_profile(dest: str, target: str, kind: str):
     """Auto-create a default profile for a freshly-downloaded model.
 
@@ -175,19 +318,8 @@ def _post_download_profile(dest: str, target: str, kind: str):
     if target != "vllm" or kind != "hf":
         print("\n  (no profile created — lmstudio target or GGUF model)")
         return
-    model_short = os.path.basename(dest)
     print("\n  Creating launch profile ...")
-    suggested = detect_model_max_len(DEFAULT_MODEL_DIR, model_short)
-    if suggested:
-        print(f"    Detected max_position_embeddings = {suggested} from config.json.")
-    _, created = ensure_profiles_exist(
-        DEFAULT_MODEL_DIR,
-        model_short,
-        interactive=False,
-        suggested_max_len=suggested,
-    )
-    p = profiles_path(DEFAULT_MODEL_DIR, model_short)
-    print(f"    {'Wrote' if created else 'Kept existing'} {p}")
+    _create_planned_profile(DEFAULT_MODEL_DIR, os.path.basename(dest))
 
 
 def _tui_act_download(stdscr):
@@ -245,10 +377,23 @@ def _tui_act_download(stdscr):
     if kind == "hf":
         weight_bytes, n_files, quant = summarize_hf_bundle(tree, repo_id)
         size_gb = weight_bytes / (1024 ** 3)
-        budget = DEFAULT_VRAM_GB * (1.0 - KV_HEADROOM)
-        fit = "ok" if size_gb <= budget else ("tight" if size_gb <= DEFAULT_VRAM_GB else "no")
+        vram = _default_vram_gb()
+        budget, _ = weights_budget(vram)
+        fit = "ok" if size_gb <= budget else ("tight" if size_gb <= vram else "no")
         print(f"\n  HF-format repo (safetensors). Quant hint: {quant or '-'}")
         print(f"  Weight files: {n_files} file(s), {size_gb:.1f} GB  —  fit: {fit}")
+        problem = _v100_compat_problem(_fetch_repo_config(repo_id, tree)) \
+            if _host_is_v100() else None
+        if problem:
+            print(f"\n  WARNING: this checkpoint will NOT run on this host's "
+                  f"V100s (SM70):")
+            print(f"    {problem}")
+            print(f"    Look for a plain 'awq' (GEMM) or 'gptq' quant instead.")
+            resp = input("  Download anyway? [y/N]: ").strip().lower()
+            if resp not in ("y", "yes"):
+                print("\n  Aborted.")
+                input("\n  Press Enter to continue ...")
+                return
         if os.path.isdir(dest) and os.listdir(dest):
             print(f"\n  Destination already exists and is non-empty: {dest}")
             print(f"  Delete it first or pick a different folder.")
@@ -270,16 +415,12 @@ def _tui_act_download(stdscr):
         input("\n  Press Enter to continue ...")
         return
 
+    vram = _default_vram_gb()
+    budget, budget_desc = weights_budget(vram)
     variants = group_variants(tree)
-    rec = recommend(variants, DEFAULT_VRAM_GB)
-    budget = DEFAULT_VRAM_GB * (1.0 - KV_HEADROOM)
+    rec = recommend(variants, budget)
     header = [
-        (
-            f"VRAM budget: {DEFAULT_VRAM_GB:.0f} GB total, "
-            f"~{budget:.0f} GB usable "
-            f"(reserving {int(KV_HEADROOM * 100)}% for KV cache).",
-            curses.A_DIM,
-        ),
+        (f"Budget: {budget_desc}.", curses.A_DIM),
         ("", 0),
         (
             f"  {'':<2}{'#':>3}  {'Quant':<14} {'Size':>9}  {'Files':>5}  "
@@ -293,7 +434,7 @@ def _tui_act_download(stdscr):
         fit = (
             "ok"
             if v.size_gb <= budget
-            else ("tight" if v.size_gb <= DEFAULT_VRAM_GB else "no")
+            else ("tight" if v.size_gb <= vram else "no")
         )
         star = "*" if v is rec else " "
         label = (
@@ -306,13 +447,14 @@ def _tui_act_download(stdscr):
     selected = _tui_select(
         stdscr, "Download \u2014 Select Variant", items, header=header
     )
+    # Leave curses BEFORE any input()/print/subprocess below \u2014 the download
+    # progress and prompts must run on a normal terminal.
+    curses.endwin()
     if selected < 0 or selected >= len(indices):
         print("\n  Aborted.")
         return
     chosen = variants[indices[selected]]
-    force = ""
     if os.path.isdir(dest) and os.listdir(dest):
-        curses.endwin()
         print(
             f"\n  Destination already exists and is non-empty: {dest}\n"
             f"  Use --force with CLI to overwrite, or delete it first."
@@ -334,7 +476,6 @@ def _tui_act_download(stdscr):
     print(f"\n  Downloading {chosen.quant} ...")
     rc = _hf_download(repo_id, chosen, dest)
     if rc != 0:
-        curses.endwin()
         print(f"\n  hf download failed (exit {rc}).")
         input("\n  Press Enter to continue ...")
         return
@@ -346,8 +487,6 @@ def _tui_act_download(stdscr):
     else:
         print(f"\n  Done. Primary file: {os.path.join(dest, main_file)}")
     _post_download_profile(dest, target, "gguf")
-    curses.endwin()
-    print("\n  Done!")
     input("\n  Press Enter to continue ...")
 
 
@@ -576,9 +715,13 @@ def _tui_pf_add(stdscr, model_name):
     extra: list[str] = []
     if info is not None:
         try:
+            tools, reasonings = _cached_parsers()
             extra = model_lib.suggest_extra_args(
                 info, tp_size=tp_size,
                 tool_use=tool_use, reasoning=reasoning,
+                v100=_host_is_v100(),
+                available_tool_parsers=tools or None,
+                available_reasoning_parsers=reasonings or None,
             )
         except Exception:
             extra = []
@@ -675,6 +818,8 @@ def _tui_pf_delete(stdscr, model_name, profs):
 
 
 def _tui_pf_edit(stdscr, model_name):
+    import curses
+
     path = profiles_path(DEFAULT_MODEL_DIR, model_name)
     if not os.path.isfile(path):
         ensure_profiles_exist(DEFAULT_MODEL_DIR, model_name, interactive=False)
@@ -686,6 +831,8 @@ def _tui_pf_edit(stdscr, model_name):
 
 
 def _tui_pf_path(stdscr, model_name):
+    import curses
+
     path = profiles_path(DEFAULT_MODEL_DIR, model_name)
     curses.endwin()
     print(f"  {path}")
@@ -892,24 +1039,32 @@ def parse_repo_id(raw: str) -> str:
 
 
 def fetch_tree(repo_id: str) -> list[dict]:
-    url = HF_TREE_API.format(repo=repo_id)
-    req = urllib.request.Request(url)
-    if HF_TOKEN:
-        req.add_header("Authorization", f"Bearer {HF_TOKEN}")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            sys.exit(
-                f"Repo requires auth. Accept the license at "
-                f"https://huggingface.co/{repo_id} and set HF_TOKEN."
-            )
-        if e.code == 404:
-            sys.exit(f"Repo not found: {repo_id}")
-        sys.exit(f"HF API error {e.code}: {e.reason}")
-    except urllib.error.URLError as e:
-        sys.exit(f"Network error: {e.reason}")
+    # The tree endpoint paginates at 1000 entries (RFC5988 Link header);
+    # follow rel="next" so huge multi-quant repos aren't silently truncated.
+    url: str | None = HF_TREE_API.format(repo=repo_id)
+    out: list[dict] = []
+    while url:
+        req = urllib.request.Request(url)
+        if HF_TOKEN:
+            req.add_header("Authorization", f"Bearer {HF_TOKEN}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                out.extend(json.loads(resp.read()))
+                link = resp.headers.get("Link") or ""
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                sys.exit(
+                    f"Repo requires auth. Accept the license at "
+                    f"https://huggingface.co/{repo_id} and set HF_TOKEN."
+                )
+            if e.code == 404:
+                sys.exit(f"Repo not found: {repo_id}")
+            sys.exit(f"HF API error {e.code}: {e.reason}")
+        except urllib.error.URLError as e:
+            sys.exit(f"Network error: {e.reason}")
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        url = m.group(1) if m else None
+    return out
 
 
 def group_variants(tree: list[dict]) -> list[RemoteVariant]:
@@ -936,17 +1091,43 @@ def group_variants(tree: list[dict]) -> list[RemoteVariant]:
     return sorted(by_quant.values(), key=lambda v: v.total_size)
 
 
-def recommend(variants: list[RemoteVariant], vram_gb: float):
+def weights_budget(vram_gb: float, *, offload: bool = False,
+                   ram_gb: float | None = None) -> tuple[float, str]:
+    """(budget_gb, human description) of how many GB of weights can be held.
+
+    Default: VRAM minus the KV-cache reservation. With offload=True (CPU+GPU
+    MoE offload, llama.cpp-style), 85% of system RAM joins the budget — the
+    other 15% stays for OS/page-cache so decode never faults to disk.
+    """
+    gpu_budget = vram_gb * (1.0 - KV_HEADROOM)
+    if not offload:
+        return gpu_budget, (
+            f"{vram_gb:.0f} GB VRAM, ~{gpu_budget:.0f} GB usable for weights "
+            f"(reserving {int(KV_HEADROOM * 100)}% for KV cache)")
+    ram = ram_gb if ram_gb is not None else _host_ram_gb()
+    total = gpu_budget + ram * 0.85
+    return total, (
+        f"offload mode: ~{gpu_budget:.0f} GB GPU + ~{ram * 0.85:.0f} GB of "
+        f"{ram:.0f} GB RAM = ~{total:.0f} GB for weights")
+
+
+def recommend(variants: list[RemoteVariant], budget_gb: float):
+    """Best variant that fits budget_gb of weights.
+
+    If NOTHING fits, returns the smallest variant (the least-impossible
+    choice) — callers must check `rec.size_gb > budget_gb` and say so
+    instead of presenting it as a fit.
+    """
     if not variants:
         return None
-    budget = vram_gb * (1.0 - KV_HEADROOM)
-    fits = [v for v in variants if v.size_gb <= budget]
-    pool = fits or variants
+    fits = [v for v in variants if v.size_gb <= budget_gb]
+    if not fits:
+        return min(variants, key=lambda v: v.total_size)
     for pref in QUANT_PREFERENCE:
-        for v in pool:
+        for v in fits:
             if pref.upper() in v.quant.upper():
                 return v
-    return max(pool, key=lambda v: v.total_size) if fits else variants[0]
+    return max(fits, key=lambda v: v.total_size)
 
 
 # -- HF-format (safetensors / AWQ / GPTQ) -----------------------------------
@@ -1012,6 +1193,60 @@ def summarize_hf_bundle(tree: list[dict],
             quant = tag
             break
     return weight_bytes, weight_files, quant
+
+
+# Quant methods whose vLLM kernels require newer-than-Volta GPUs. Keyed by
+# quantization_config.quant_method as it appears in repo config.json.
+# The trap this catches: repos NAMED "AWQ" that are actually one of these
+# (e.g. cyankiwi/GLM-4.7-Flash-AWQ-4bit is compressed-tensors → Marlin).
+_SM80_QUANT_METHODS = {
+    "compressed-tensors": "routes to Marlin kernels (needs SM80+/Ampere)",
+    "compressed_tensors": "routes to Marlin kernels (needs SM80+/Ampere)",
+    "fp8":                "FP8 needs SM89+ (Ada/Hopper)",
+    "modelopt":           "ModelOpt FP8/NVFP4 needs SM89+",
+    "modelopt_fp4":       "NVFP4 needs SM100 (Blackwell)",
+    "nvfp4":              "NVFP4 needs SM100 (Blackwell)",
+    "mxfp4":              "MXFP4 needs SM90+",
+    "w4afp8":             "W4AFP8 needs SM90 (Hopper)",
+    "awq_marlin":         "Marlin kernels need SM80+ (use plain 'awq')",
+    "gptq_marlin":        "Marlin kernels need SM80+ (use plain 'gptq')",
+}
+
+
+def _fetch_repo_config(repo_id: str, tree: list[dict]) -> dict | None:
+    """Fetch and parse the repo's (shallowest) config.json; None on failure."""
+    paths = [f.get("path", "") for f in tree if f.get("type") == "file"
+             and os.path.basename(f.get("path", "")) == "config.json"]
+    if not paths:
+        return None
+    paths.sort(key=lambda p: p.count("/"))
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{paths[0]}"
+    req = urllib.request.Request(url)
+    if HF_TOKEN:
+        req.add_header("Authorization", f"Bearer {HF_TOKEN}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _v100_compat_problem(cfg: dict | None) -> str | None:
+    """Why this checkpoint can't run on SM70, or None if it looks fine.
+
+    Only judges the quantization method; unquantized and awq/gptq/bnb
+    checkpoints pass (bf16 configs are served as fp16 on Volta).
+    """
+    if not cfg:
+        return None
+    qc = cfg.get("quantization_config") or {}
+    if not qc and isinstance(cfg.get("text_config"), dict):
+        qc = cfg["text_config"].get("quantization_config") or {}
+    method = str(qc.get("quant_method")
+                 or qc.get("quantization_method") or "").lower()
+    if method in _SM80_QUANT_METHODS:
+        return f"quant_method '{method}': {_SM80_QUANT_METHODS[method]}"
+    return None
 
 
 def _hf_download_bundle(repo_id: str, dest: str,
@@ -1110,14 +1345,12 @@ def cmd_delete(args):
 # =============================================================================
 
 
-def _print_remote_table(variants, rec, vram_gb):
-    budget = vram_gb * (1.0 - KV_HEADROOM)
+def _print_remote_table(variants, rec, budget: float, budget_desc: str):
+    # "tight" = over the weights budget but within the raw capacity (i.e.
+    # would only fit with no KV/OS headroom — possible but unwise).
+    raw_capacity = budget / (1.0 - KV_HEADROOM)
     print()
-    print(
-        f"  VRAM budget: {vram_gb:.0f} GB total, "
-        f"~{budget:.0f} GB usable for weights "
-        f"(reserving {int(KV_HEADROOM * 100)}% for KV cache)."
-    )
+    print(f"  Budget: {budget_desc}.")
     print()
     print(
         f"  {'':<2}{'#':>3}  {'Quant':<14} {'Size':>9}  "
@@ -1125,17 +1358,24 @@ def _print_remote_table(variants, rec, vram_gb):
     )
     print("  " + "-" * 74)
     for i, v in enumerate(variants, 1):
-        fit = "ok" if v.size_gb <= budget else "tight" if v.size_gb <= vram_gb else "no"
+        fit = ("ok" if v.size_gb <= budget
+               else "tight" if v.size_gb <= raw_capacity else "no")
         star = "*" if v is rec else " "
         print(
             f"  {star} {i:>2}  {v.quant:<14} {v.size_gb:>7.1f} GB  "
             f"{len(v.files):>5}  {fit:<5}  {v.include_pattern}"
         )
     print()
-    if rec:
+    if rec and rec.size_gb > budget:
+        print(
+            f"  NOTHING here fits the budget. Smallest is {rec.quant} "
+            f"({rec.size_gb:.1f} GB) — needs ~{rec.size_gb - budget:.0f} GB "
+            f"more. Consider --offload (CPU+GPU) or a smaller model."
+        )
+    elif rec:
         print(
             f"  Recommended: {rec.quant} ({rec.size_gb:.1f} GB) — "
-            f"best quality from preference list that fits your VRAM."
+            f"best quality from preference list that fits the budget."
         )
     print()
 
@@ -1223,15 +1463,21 @@ def _resolve_download_dest(target: str, repo_id: str,
 
 
 def cmd_download(args):
-    if subprocess.run(["which", "hf"], capture_output=True).returncode != 0:
+    # --dry-run never downloads, so it shouldn't require the hf CLI.
+    if not args.dry_run and subprocess.run(
+            ["which", "hf"], capture_output=True).returncode != 0:
         sys.exit(
             "'hf' CLI not found. Install with: pip install -U 'huggingface_hub[cli]'"
         )
 
     repo_id = parse_repo_id(args.repo)
 
-    target = args.target or _prompt_target()
+    # --yes means non-interactive: don't stop to ask where it goes.
+    target = args.target or ("vllm" if args.yes else _prompt_target())
     root, short, dest = _resolve_download_dest(target, repo_id, args.name)
+    vram = args.vram if args.vram else _default_vram_gb()
+    budget, budget_desc = weights_budget(
+        vram, offload=args.offload, ram_gb=args.ram)
 
     if os.path.isdir(dest) and os.listdir(dest) and not args.force:
         sys.exit(
@@ -1250,12 +1496,28 @@ def cmd_download(args):
     if kind == "hf":
         weight_bytes, n_files, quant = summarize_hf_bundle(tree, repo_id)
         size_gb = weight_bytes / (1024 ** 3)
-        budget = args.vram * (1.0 - KV_HEADROOM)
-        fit = "ok" if size_gb <= budget else ("tight" if size_gb <= args.vram else "no")
+        fit = "ok" if size_gb <= budget else ("tight" if size_gb <= vram else "no")
         print()
         print(f"  HF-format repo (safetensors). Quant hint: {quant or '-'}")
         print(f"  Weight files: {n_files} file(s), {size_gb:.1f} GB total — fit: {fit}")
         print()
+        if _host_is_v100():
+            problem = _v100_compat_problem(_fetch_repo_config(repo_id, tree))
+            if problem:
+                print(f"  WARNING: this checkpoint will NOT run on this "
+                      f"host's V100s (SM70):")
+                print(f"    {problem}")
+                print(f"    Look for a plain 'awq' (GEMM) or 'gptq' quant "
+                      f"of the same model instead.")
+                print()
+                if args.yes:
+                    sys.exit("  Refusing under --yes. Re-run interactively "
+                             "to override.")
+                if not args.dry_run:
+                    resp = input("  Download anyway? [y/N]: ").strip().lower()
+                    if resp not in ("y", "yes"):
+                        print("  Aborted.")
+                        return
         if args.dry_run:
             return
         if not args.yes:
@@ -1272,17 +1534,7 @@ def cmd_download(args):
         if target == "vllm":
             print()
             print("Creating launch profile ...")
-            suggested = detect_model_max_len(root, short)
-            if suggested:
-                print(f"  Detected max_position_embeddings = {suggested} "
-                      f"from config.json.")
-            _, created = ensure_profiles_exist(
-                root, short,
-                interactive=not args.yes,
-                suggested_max_len=suggested,
-            )
-            p = profiles_path(root, short)
-            print(f"  {'Wrote' if created else 'Kept existing'} {p}")
+            _create_planned_profile(root, short)
         else:
             print("  (lmstudio target — no profile created.)")
         return
@@ -1298,12 +1550,17 @@ def cmd_download(args):
                     sys.exit(f"\nhf download failed (exit {rc}).")
                 print(f"\nDone. Model dir: {dest}")
                 return
-        rec = recommend(variants, args.vram)
-        _print_remote_table(variants, rec, args.vram)
+        rec = recommend(variants, budget)
+        _print_remote_table(variants, rec, budget, budget_desc)
 
         if args.dry_run:
             return
 
+        if args.yes and rec and rec.size_gb > budget:
+            sys.exit(
+                f"  --yes given but nothing fits the budget "
+                f"(smallest: {rec.quant}, {rec.size_gb:.1f} GB). "
+                f"Try --offload or pick explicitly without --yes.")
         chosen = rec if args.yes else _pick_variant(variants, rec)
         if not chosen:
             print("  Aborted.")
@@ -1416,11 +1673,23 @@ def cmd_profile_add(args):
     elif "default" in profs:
         new_p = copy_profile(profs["default"], args.name)
     else:
-        # No default yet — seed a fresh one.
+        # No default yet — seed a fresh one, with the same auto-templated
+        # extra_args (quantization flag, parsers, V100 arg set) the
+        # auto-created default would get.
         suggested = detect_model_max_len(args.dir, args.model) or DEFAULT_MAX_MODEL_LEN
         new_p = make_default_profile(max_model_len=suggested)
         new_p.name = args.name
         new_p.description = "New profile."
+        try:
+            info = model_lib.detect_family(args.dir, args.model)
+            tools, reasonings = _cached_parsers()
+            new_p.extra_args = model_lib.suggest_extra_args(
+                info, tp_size=new_p.tp_size, v100=_host_is_v100(),
+                available_tool_parsers=tools or None,
+                available_reasoning_parsers=reasonings or None,
+            )
+        except Exception:
+            pass
 
     profs[args.name] = new_p
     path = save_profiles(args.dir, args.model, profs)
@@ -1510,8 +1779,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--vram",
         type=float,
-        default=DEFAULT_VRAM_GB,
-        help=f"Available VRAM in GB (default: {DEFAULT_VRAM_GB})",
+        default=None,
+        help="Available VRAM in GB (default: sum of detected GPUs, "
+             f"else {DEFAULT_VRAM_GB})",
+    )
+    sp.add_argument(
+        "--offload",
+        action="store_true",
+        help="Budget for CPU+GPU MoE offload (llama.cpp-style): adds 85%% "
+             "of system RAM to the weight budget when recommending quants",
+    )
+    sp.add_argument(
+        "--ram",
+        type=float,
+        default=None,
+        help="System RAM in GB for --offload (default: read /proc/meminfo)",
     )
     sp.add_argument(
         "--yes",

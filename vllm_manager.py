@@ -400,6 +400,25 @@ def _gpus(refresh: bool = False) -> list[dict]:
     return _GPU_CACHE
 
 
+def _host_is_v100() -> bool:
+    """SM70 host — profiles authored here need the fork's V100 arg set."""
+    return any((g.get("compute_cap") or "").startswith("7.0")
+               or "V100" in (g.get("name") or "")
+               for g in _gpus())
+
+
+def _auto_create_default_profile(name: str):
+    """ensure_profiles_exist with host-aware args (V100 set, parser gating)."""
+    from model_lib import ensure_profiles_exist
+    tools, reasonings = model_lib.read_cached_parsers(VLLM_VERSION_FILE + ".json")
+    return ensure_profiles_exist(
+        MODEL_DIR, name, interactive=False,
+        v100=_host_is_v100(),
+        available_tool_parsers=tools or None,
+        available_reasoning_parsers=reasonings or None,
+    )
+
+
 def _is_vllm_pid(pid: int) -> bool:
     """True if a GPU-using pid is one of ours (runs from the vLLM venv) or
     otherwise looks like a vLLM server/worker. Lets us split GPU memory into
@@ -871,8 +890,7 @@ def _resolve_profile(name: str, profile_name: str) -> Profile:
 
     # Silently auto-create a default profile so `start <model>` Just Works
     # the first time after download without an extra step.
-    from model_lib import ensure_profiles_exist
-    profs, created = ensure_profiles_exist(MODEL_DIR, name, interactive=False)
+    profs, created = _auto_create_default_profile(name)
     if created:
         print(f"  Auto-created default profile at {profiles_path(MODEL_DIR, name)}.")
     return profs["default"]
@@ -1713,9 +1731,7 @@ def cmd_plan(args):
     tool_set, reasoning_set = model_lib.read_cached_parsers(VLLM_VERSION_FILE + ".json")
     # SM70 (V100) needs the fork's attention backend and omits expert-parallel;
     # detect it so `plan --apply` writes a profile that actually runs here.
-    is_v100 = any(
-        (g.get("compute_cap") or "").startswith("7.0") or "V100" in g.get("name", "")
-        for g in _gpus())
+    is_v100 = _host_is_v100()
     extra_args = model_lib.suggest_extra_args(
         info, tp_size=p.tp_size,
         tool_use=not args.no_tool_use,
@@ -2472,8 +2488,7 @@ def _tui_act_start(stdscr):
         # Auto-seed a default profile and proceed.
         curses.endwin()
         print(f"\nNo profiles yet for '{model_name}'. Creating default ...")
-        from model_lib import ensure_profiles_exist
-        profs, _ = ensure_profiles_exist(MODEL_DIR, model_name, interactive=False)
+        profs, _ = _auto_create_default_profile(model_name)
         print(f"  Wrote {profiles_path(MODEL_DIR, model_name)}")
         input("\nPress Enter to continue ...")
         stdscr.touchwin()
