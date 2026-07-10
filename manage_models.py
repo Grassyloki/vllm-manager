@@ -554,27 +554,12 @@ def _tui_act_profiles(stdscr, model_name):
 
 
 def _tui_pf_list(stdscr, model_name):
-    profs = load_profiles(DEFAULT_MODEL_DIR, model_name)
-    path = profiles_path(DEFAULT_MODEL_DIR, model_name)
-    print(f"\n  {model_name}  ({path})")
-    if not profs:
-        print("    (no profiles; run `profile add <name>` to create one)\n")
-        input("\n  Press Enter to continue ...")
-        return
-    print(
-        f"\n  {'Name':<14}  {'Engine':<6}  {'TP':>2}  {'GPU':<8}  "
-        f"{'Ctx':>7}  Description"
-    )
-    print("  " + "-" * 72)
-    for name in sorted(profs.keys(), key=lambda n: (n != "default", n.lower())):
-        p = profs[name]
-        desc = p.description[:40] + ("…" if len(p.description) > 40 else "")
-        print(
-            f"  {name:<14}  {p.engine:<6}  {p.tp_size:>2}  "
-            f"{p.gpu:<8}  {p.max_model_len:>7}  {desc}"
-        )
-    print()
-    input("\n  Press Enter to continue ...")
+    # Reuse the CLI printer via run_cmd, which handles the leave-curses /
+    # print / pause / restore dance. Printing directly here (as this used to)
+    # runs input() in curses raw mode: staircase output and an Enter key
+    # (\r, never \n) that input() waits on forever.
+    tui.run_cmd(stdscr, cmd_profile_list,
+                argparse.Namespace(dir=DEFAULT_MODEL_DIR, model=model_name))
 
 
 def _tui_pf_show(stdscr, model_name, profs):
